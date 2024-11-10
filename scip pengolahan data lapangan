@@ -1,0 +1,170 @@
+// Step 1: Import dan memilih citra Sentinel 2A pada rentang waktu dan area beserta cloud mask
+function maskS2clouds(image) {
+  var cloudProb = image.select('MSK_CLDPRB');
+  var mask = cloudProb.lt(20);
+
+  return image.updateMask(mask).divide(10000)
+      .select("B.*")
+      .copyProperties(image, ["system:time_start"]);
+}
+
+var sr2ACol = ee.ImageCollection('COPERNICUS/S2_SR')
+    .filterDate('2024-01-01', '2024-09-30')
+    .filterBounds(AREA)
+    .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
+    .map(maskS2clouds)
+    .median();
+    
+Map.centerObject(AREA, 11);
+
+// Step 2: Menampilkan citra pada peta
+var imageVisParam = {
+  bands: ['B4', 'B3', 'B2'],
+  min: 0,
+  max: 0.3
+};
+Map.addLayer(sr2ACol.clip(AREA), imageVisParam, 'RGB');
+
+// Step 3: Data lapangan
+var DATA_LAPANGAN1 = ee.FeatureCollection('projects/ee-winaapriani62377/assets/DATA_LAPANGAN_COBA');
+
+// step 3.1 Pusatkan peta pada data lapangan
+Map.centerObject(DATA_LAPANGAN1, 5);
+Map.addLayer(DATA_LAPANGAN1, {color: 'blue'}, 'DATA LAPANGAN_COBA');
+
+// Step 4: Koreksi permukaan (Xij)
+var image = sr2ACol.select("B1", "B2", "B3", "B4", "B8").clip(AREA);
+
+var extent = ee.Feature(AREALAUTDALAM);
+var deepAve = image.reduceRegion({
+  reducer: ee.Reducer.mean(),
+  geometry: extent.geometry(),
+  scale: 10,
+  maxPixels: 1e9
+});
+print(deepAve);
+
+// Step 4.2: Implementasi algoritma Xi
+var X1cor = image.select(['B1']).subtract(0.16971).log().rename('X1');
+var X2cor = image.select(['B2']).subtract(0.17177).log().rename('X2');
+var X3cor = image.select(['B3']).subtract(0.16757).log().rename('X3');
+var X4cor = image.select(['B4']).subtract(0.14936).log().rename('X4');
+
+var Xij = X1cor.addBands(X2cor).addBands(X3cor).addBands(X4cor);
+Map.addLayer(Xij, imageVisParam2, 'Image Koreksi Permukaan');
+
+// step 5 implementasi algoritma Yij
+// step 5.1 calculate ki/kj
+var imgsand = Xij.clip(sand);
+var k23 = imgsand.select(['X2','X3'])
+    .reduceRegion(ee.Reducer.linearRegression(1,1), imgsand.get('system:footprint'), 10);
+print(k23);
+var k24 = imgsand.select(['X2','X4'])
+    .reduceRegion(ee.Reducer.linearRegression(1,1), imgsand.get('system:footprint'), 10);
+print(k24);
+var k34 = imgsand.select(['X3','X4'])
+    .reduceRegion(ee.Reducer.linearRegression(1,1), imgsand.get('system:footprint'), 10);
+print(k34);
+
+// step 5.2 calculate depth invariance index (Yij)
+var Y23 = Xij.select(['X2']).subtract(Xij.select(['X3']).multiply(0.82350)).rename('Y23');
+var Y24 = Xij.select(['X2']).subtract(Xij.select(['X4']).multiply(0.81836)).rename('Y24');
+var Y34 = Xij.select(['X3']).subtract(Xij.select(['X4']).multiply(0.99722)).rename('Y34');
+
+var Yij = Y23.addBands(Y24).addBands(Y34);
+Map.addLayer(Yij, imageVisParam3, 'Indeks Kedalaman Yij');
+
+// Step 6 : Sampling data dari citra menggunakan data lapangan
+var trainingData = Xij.sampleRegions({
+  collection: DATA_LAPANGAN1,
+  properties: ['class'],
+  scale: 10
+});
+print('Training Data:', trainingData);
+
+// Step 7 : Filter out missing values
+var filteredTrainingData = trainingData.filter(ee.Filter.notNull(['X1', 'X2', 'X3', 'X4']));
+print('Filtered Training Data:', filteredTrainingData);
+
+// Step 7 : Latih model Random Forest
+var bands = ['X1', 'X2', 'X3', 'X4'];
+var classifierRF = ee.Classifier.smileRandomForest(50).train({
+  features: filteredTrainingData,
+  classProperty: 'class',
+  inputProperties: bands
+});
+
+// Step 8 : Klasifikasikan citra menggunakan model Random Forest
+var classifiedImageRF = Xij.select(bands).classify(classifierRF);
+
+// 8.1 Tampilkan hasil klasifikasi pada peta
+Map.addLayer(classifiedImageRF, {
+  min: 0,
+  max: 3,  // Sesuaikan jumlah kelas
+  palette: ['red', 'green', 'blue', 'brown']  // Warna untuk setiap kelas
+}, 'Hasil Klasifikasi RF');
+
+
+// Step 9: Split data into training and testing
+var sampledData = filteredTrainingData.randomColumn();
+var trainingSet = sampledData.filter(ee.Filter.lt('random', 0.7)); // 70% data untuk training
+var testSet = sampledData.filter(ee.Filter.gte('random', 0.7)); // 30% data untuk testing
+
+// Step 10 : Uji model RF dengan test data
+var testClassification = testSet.classify(classifierRF);
+
+// 11 Generate confusion matrix untuk Random Forest
+var confusionMatrixRF = testClassification.errorMatrix('class', 'classification');
+print('Confusion Matrix RF:', confusionMatrixRF);
+print('Overall Accuracy RF:', confusionMatrixRF.accuracy());
+print('User Accuracy (UA) RF:', confusionMatrixRF.consumersAccuracy());
+print('Producer Accuracy (PA) RF:', confusionMatrixRF.producersAccuracy());
+print('Kappa Coefficient RF:', confusionMatrixRF.kappa());
+
+
+// Step 12: Export hasil klasifikasi RF ke Google Drive
+Export.image.toDrive({
+  image: classifiedImageRF,
+  description: 'pemetaan_2024',
+  scale: 10,
+  region: AREA,
+  fileFormat: 'GeoTIFF'
+});
+
+// Step 13: Menghitung luas tiap kelas dalam hektar
+var pixelArea = ee.Image.pixelArea();  // Menghitung area tiap piksel
+
+// Fungsi untuk menghitung luas per kelas dalam hektar
+var calculateAreaPerClass = function(classValue) {
+  var classMask = classifiedImageRF.eq(classValue);
+  var area = pixelArea.updateMask(classMask).reduceRegion({
+    reducer: ee.Reducer.sum(),
+    geometry: AREA,
+    scale: 10,  // Sesuaikan dengan resolusi citra
+    maxPixels: 1e13
+  });
+  
+  var areaInHectares = ee.Number(area.get('area')).divide(10000); // Konversi ke hektar
+  return areaInHectares;
+};
+
+// Nilai kelas (misal: 0 = lamun, 1 = pasir, 2 = lumpur, 3 = batu,)
+var classValues = [0, 1, 2, 3,];  // Sesuaikan dengan jumlah kelas pada klasifikasi
+
+// Hitung luas tiap kelas dan konversi ke hektar
+classValues.forEach(function(classValue) {
+  var area = calculateAreaPerClass(classValue);
+  print('Luas kelas ' + classValue + ' (ha):', area);
+});
+
+// = lamun, 1 = pasir, 2 = lumpur, 3 = batu)
+var classValues = [0, 1, 2, 3];  // Sesuaikan dengan jumlah kelas pada klasifikasi
+
+// Hitung luas tiap kelas dan konversi ke hektar
+classValues.forEach(function(classValue) {
+  var area = calculateAreaPerClass(classValue);
+  print('Luas kelas ' + classValue + ' (ha):', area);
+});
+
+
+
