@@ -1,0 +1,167 @@
+// step 1 import dan memilih citra Sentinel 2A pada rentang waktu dan area beserta cloud mask
+function maskS2clouds(image) {
+  var qa = image.select('QA60');
+
+  var cloudBitMask = 1 << 10;
+  var cirrusBitMask = 1 << 11;
+
+  var mask = qa.bitwiseAnd(cloudBitMask).eq(0).and(
+             qa.bitwiseAnd(cirrusBitMask).eq(0));
+
+  return image.updateMask(mask).divide(10000)
+      .select("B.*")
+      .copyProperties(image, ["system:time_start"]);
+}
+
+var sr2ACol = ee.ImageCollection('COPERNICUS/S2_SR')
+    .filterDate('2021-01-01', '2021-12-31')
+    .filterBounds(AREA)
+    .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
+    .map(maskS2clouds)
+    .median();
+Map.centerObject(AREA, 13.5);
+
+// step 2 menampilkan citra pada peta
+Map.addLayer(sr2ACol.clip(AREA), imageVisParam , 'RGB');
+
+// step 3 koreksi permukaan (Xij)
+// step 3.1 rerata nilai laut dalam
+var image = sr2ACol.select("B1", "B2", "B3", "B4", "B8").clip(AREA);
+
+var extent = ee.Feature(arealautdalam);
+var deepAve = image.reduceRegion({
+  reducer: ee.Reducer.mean(),
+  geometry: extent.geometry(),
+  scale: 10,
+  maxPixels: 1e9
+});
+
+print(deepAve);
+
+// step 3.2 implementasi algoritma Xi = ln(laut dangkal - rerata laut dalam)
+var X1cor = image.select(['B1']).subtract(0.08981).log().rename('X1');
+var X2cor = image.select(['B2']).subtract(0.09142).log().rename('X2');
+var X3cor = image.select(['B3']).subtract(0.08855).log().rename('X3');
+var X4cor = image.select(['B4']).subtract(0.06766).log().rename('X4');
+
+var Xij = X1cor.addBands(X2cor).addBands(X3cor).addBands(X4cor);
+
+Map.addLayer(Xij, imageVisParam2, 'Image Koreksi Permukaan');
+
+// step 4 implementasi algoritma Yij
+// step 4.1 calculate ki/kj
+var imgsand = Xij.clip(sand);
+var k23 = imgsand.select(['X2','X3'])
+    .reduceRegion(ee.Reducer.linearRegression(1,1), imgsand.get('system:footprint'), 10);
+print(k23);
+var k24 = imgsand.select(['X2','X4'])
+    .reduceRegion(ee.Reducer.linearRegression(1,1), imgsand.get('system:footprint'), 10);
+print(k24);
+var k34 = imgsand.select(['X3','X4'])
+    .reduceRegion(ee.Reducer.linearRegression(1,1), imgsand.get('system:footprint'), 10);
+print(k34);
+
+// step 4.2 calculate depth invariance index (Yij)
+var Y23 = Xij.select(['X2']).subtract(Xij.select(['X3']).multiply(0.67168)).rename('Y23');
+var Y24 = Xij.select(['X2']).subtract(Xij.select(['X4']).multiply(0.59830)).rename('Y24');
+var Y34 = Xij.select(['X3']).subtract(Xij.select(['X4']).multiply(0.90295)).rename('Y34');
+
+var Yij = Y23.addBands(Y24).addBands(Y34);
+
+Map.addLayer(Yij, imageVisParam3, 'Indeks Kedalaman Yij');
+
+// step 5 sampling data collection
+// step 5.1 class "lamun", "pasir","lumpur", "batu"
+var points = ee.FeatureCollection([
+  ee.Feature(lamun, {class: 0}),
+  ee.Feature(sand, {class: 1}),
+  ee.Feature(lumpur, {class: 2}),
+  ee.Feature(batu, {class: 3}),
+]);
+
+
+// step 5.2 training and testing data
+var bands = ['B2', 'B3', 'B4', 'B8'];
+var training = image.select(bands).sampleRegions({
+  collection: points,
+  properties: ['class'],
+  scale: 10
+});
+
+var withRandom = training.randomColumn('random');
+var split = 0.7; // 70% training 30% testing
+var trainingPoints = withRandom.filter(ee.Filter.lt('random', split));
+var testingPoints = withRandom.filter(ee.Filter.gte('random', split));
+
+print(testingPoints);
+
+
+// Step 6: Klasifikasi menggunakan Random Forest
+var classifierRF = ee.Classifier.smileRandomForest(100).train({
+  features: trainingPoints,
+  classProperty: 'class',
+  inputProperties: bands
+});
+
+// Classify the image
+var classifiedRF = image.classify(classifierRF);
+
+// Tampilkan hasil klasifikasi
+Map.addLayer(classifiedRF, {
+  min: 0, 
+  max: 3, 
+  palette: ['red', 'yellow', 'green', 'blue']
+}, 'Lamun (Random Forest)');
+
+// Step 8: Accuracy Assessment 
+var validationRF = testingPoints.classify(classifierRF);
+print(validationRF);
+
+var testAccuracyRF = validationRF.errorMatrix('class', 'classification');
+
+// Print the error matrix to the console
+print('Validation error matrix: ', testAccuracyRF);
+print('Validation overall accuracy: ', testAccuracyRF.accuracy());
+
+var OA = testAccuracyRF.accuracy();
+var CA = testAccuracyRF.consumersAccuracy();
+var Kappa = testAccuracyRF.kappa();
+var PA = testAccuracyRF.producersAccuracy();
+
+print(OA, 'Overall Accuracy');
+print(CA, 'Consumers Accuracy');
+print(Kappa, 'Kappa');
+print(PA, 'Producers Accuracy');
+// Export the Random Forest classification result
+Export.image.toDrive({
+  image: classifiedRF,
+  description: 'pemetaan_lamun_2021',
+  scale: 30,
+  region: AREA,
+});
+
+// Step 13: Menghitung luas tiap kelas dalam hektar
+var pixelArea = ee.Image.pixelArea();  // Menghitung area tiap piksel
+
+// Fungsi untuk menghitung luas per kelas dalam hektar
+var calculateAreaPerClass = function(classValue) {
+  var classMask = classifiedRF.eq(classValue);  // Use classifiedRF
+  var area = pixelArea.updateMask(classMask).reduceRegion({
+    reducer: ee.Reducer.sum(),
+    geometry: AREA,
+    scale: 10,  // Sesuaikan dengan resolusi citra
+    maxPixels: 1e13
+  });
+  
+  var areaInHectares = ee.Number(area.get('area')).divide(10000); // Konversi ke hektar
+  return areaInHectares;
+};
+
+// Nilai kelas (misal: 0 = lamun, 1 = pasir, 2 = lumpur, 3 = batu)
+var classValues = [0, 1, 2, 3];  // Sesuaikan dengan jumlah kelas pada klasifikasi
+
+// Hitung luas tiap kelas dan konversi ke hektar
+classValues.forEach(function(classValue) {
+  var area = calculateAreaPerClass(classValue);
+  print('Luas kelas ' + classValue + ' (ha):', area);
+});
